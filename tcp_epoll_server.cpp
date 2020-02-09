@@ -137,19 +137,28 @@ int TCP_Server::create_and_bind(const string &localHost, const uint16_t &localPo
   if (setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, &sockoptsargs, sizeof(int)) < 0)
      std::cerr << "[W] setsockopt(SO_REUSEADDR) failed.. May get bind error..\n";
 
-  // lookup provided hostname to address, use DNS/HOSTFILE if needed..
-  struct hostent *hp = gethostbyname(localHost.c_str());
-  if ( hp == NULL ) {
-    std::cerr << "[E] gethostbyname() failed.  Unable to resolve hostname: " << localHost << "\n";
-    return -1;
-  }
-  std::cout << "[N] setting up listener on: " << inet_ntoa( *(struct in_addr*)(hp->h_addr_list[0])) << ":" << localPort << "\n";
- 
   // build address struct for bind to use..
   struct sockaddr_in address;
   memset(&address, 0, sizeof(sockaddr_in));
   address.sin_family = AF_INET;
-  memcpy(&address.sin_addr, hp->h_addr_list[0], hp->h_length);
+
+  std::cout << "Debug: localHost = \"" << localHost << "\"\n";
+
+  if ( localHost.compare("INADDR_ANY") != 0 ) {
+    // lookup provided hostname to address, use DNS/HOSTFILE if needed..
+    struct hostent *hp = gethostbyname(localHost.c_str());
+    if ( hp == NULL ) {
+      std::cerr << "[E] gethostbyname() failed.  Unable to resolve hostname: " << localHost << "\n";
+      return -1;
+    }
+    std::cout << "[N] setting up listener on: " << inet_ntoa( *(struct in_addr*)(hp->h_addr_list[0])) << ":" << localPort << "\n";
+    memcpy(&address.sin_addr, hp->h_addr_list[0], hp->h_length);
+  } else {
+    // bind to any interface 0.0.0.0
+    std::cout << "[N] setting up listener on: INADDR_ANY:" << localPort << "\n";
+    address.sin_addr.s_addr = INADDR_ANY; 
+  }
+  // use port provided..
   address.sin_port = htons(localPort);
 
   // bind to port..
@@ -345,7 +354,7 @@ int main() {
   AppRunning.store(true);
 
 
-  TCP_Server myTCPServer("localhost", 9090);
+  TCP_Server myTCPServer(9090);
   // wait 1 second before check to see if TCP_Server started correctly..
   std::this_thread::sleep_for (std::chrono::seconds(1)); 
   if (! myTCPServer.isAlive()) {
