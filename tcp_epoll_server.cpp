@@ -41,10 +41,10 @@
 #include <cstdint>
 #include <atomic>
 #include <cstdlib>
-#include <signal.h>
 #include <chrono>
 #include <memory>
 #include <algorithm>
+#include <sstream>
 
 // linux headers for sockets and epoll
 #include <sys/epoll.h>
@@ -55,11 +55,17 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 
+// signal handling
+#include <signal.h>
+
+// default to search in std namespace.
 using namespace std;
 
+// used by main() loop to signal shutdown of server from OS signal.
 atomic<bool> AppRunning;
 
 void sig_handler(int signo) {
+  // shutdown on any signal received.
   AppRunning.store(false);
 }
 
@@ -68,6 +74,10 @@ void sig_handler(int signo) {
 // to us per epoll_wait() call..
 constexpr int tcp_epoll_max_events = 32;
 
+////////////////////////////////////////////////////////////
+// TCP Server class
+// Use this class and extend it for your application..
+//
 class TCP_Server {
   public:
     //* constructor to define bind interface and port
@@ -79,9 +89,13 @@ class TCP_Server {
     // tell if TCP server is running
     bool isAlive() { return isRunning; }
   private:
-    int socketfd; // server socket..
+    // socket used by listener to accept connections.
+    int socketfd;
+    // create socket and bind to interface.
     int create_and_bind(const string &localHost, const uint16_t &localPort);
+    // make a socket not blocking.
     bool make_socket_nonblocking( int socketfd);
+    // accept a new connection, add it to list of clients.
     int accept_connection(int socketfd, struct epoll_event& event, int epollfd);
 
     /////////////////////////////////////////////////////////////////////
@@ -95,10 +109,10 @@ class TCP_Server {
     // member datastructures
     atomic<bool> worker_state; // 0 -- offline, 1 -- online, set by worker thread.
     atomic<bool> isRunning; // when true, tells worker to keep running. False signals worker to stop.
-    thread epoll_worker;
-    struct epoll_event event;
-    array<struct epoll_event, ::tcp_epoll_max_events> events; // list of events to handle
-    vector<int> client_fd_list;
+    thread epoll_worker; // worker thread running event_worker() method.
+    struct epoll_event event; // epoll event structure for configurating epoll
+    array<struct epoll_event, ::tcp_epoll_max_events> events; // list of events to handle from epoll_wait() call.
+    vector<int> client_fd_list; // list of connected client file descriptors.
 };
 
 ///////////////////////////////////////////////////////
@@ -122,9 +136,11 @@ TCP_Server::TCP_Server(uint16_t localPort) {
 //////////////////////////////////////////////////////
 // Destructor to shutdown service threads..
 TCP_Server::~TCP_Server() {
+  //signal shutdown of event_worker thread.  Wait for it finish.
   stop_event_worker();
 }
 
+// create a IPv4 socket and bind to the interface. (doesn't not listen() ..)
 int TCP_Server::create_and_bind(const string &localHost, const uint16_t &localPort) {
   // create TCP/IP V4 socket..
   if (( socketfd=socket(AF_INET, SOCK_STREAM, 0)) == 0) {
@@ -170,6 +186,7 @@ int TCP_Server::create_and_bind(const string &localHost, const uint16_t &localPo
   return 0;
 }
 
+// make a socket nonblocking.
 bool TCP_Server::make_socket_nonblocking( int socketfd) {
   int flags = fcntl(socketfd, F_GETFL, 0);
   if (flags == -1) {
@@ -187,6 +204,11 @@ bool TCP_Server::make_socket_nonblocking( int socketfd) {
 }
 
 // called by event_worker to accept new connections
+// called when a new connect event occurs.
+// This accepts the connection,
+// makes the new clientfd nonblocking,
+// adds the clientfd to epoll system.
+// returns new clientfd value.
 int TCP_Server::accept_connection(int socketfd, struct epoll_event& event, int epollfd) {
   struct sockaddr in_addr;
   socklen_t in_len = sizeof(in_addr);
@@ -232,6 +254,9 @@ int TCP_Server::accept_connection(int socketfd, struct epoll_event& event, int e
 ////////////////////////////////////
 // This is the magic thread worker
 // update this part for your project..
+// create listener to receive new connections.
+// Create epoll service requests.
+// Main Epoll event loop, process events from epoll_wait() call.
 void TCP_Server::event_worker() {
   // startup
   // create listener
@@ -254,8 +279,10 @@ void TCP_Server::event_worker() {
     return;
   }
 
+  // signal to world that this thread is now running.
   worker_state.store(true);
 
+  // loop until external service tells us to stop.
   while ( isRunning.load(memory_order_acquire) == true ) {
     // wait untill kernel has between 1 - 32 events for us to process.
     // timesout after 500 milliseconds. (for polling if thread should die or not.)
@@ -264,25 +291,36 @@ void TCP_Server::event_worker() {
     // if timed out, n=0 and the for loop will not run..
     for (int i = 0; i < n; ++i)
     {
-      cout << "event[" << i << "] = " << events[i].events << std::endl;
+      //cout << "event[" << i << "] = " << events[i].events << std::endl;
 
       if (events[i].events & EPOLLERR ||
         events[i].events & EPOLLHUP ||
         !(events[i].events & EPOLLIN)) // error
       {
-        std::cerr << "[E] epoll event error detected\n";
+        // got errorr event that was not part of an read event..
+        std::cerr << "[E] epoll event error detected from client " << events[i].data.fd << ".  Closing Socket..\n";
         close(events[i].data.fd);
       }
-      else if (socketfd == events[i].data.fd) // new connection
+      else if (socketfd == events[i].data.fd) // new connection, event fd is same as socketfd for listener.
       {
         std::cerr << "[N] accepting a new connection..\n";
         int newclientfd = accept_connection(socketfd, event, epollfd);
-        if ( newclientfd > 0 )
+        // if valid client ID, add to list and send welcome message.
+        if ( newclientfd > 0 ) {
           client_fd_list.push_back(newclientfd);
+          // build message to send to client to tell them there client ID.
+          ostringstream oss;
+          oss << "you are client id:" << newclientfd << "\r\n";
+          string mesg = oss.str();
+          write(newclientfd, (void*)mesg.c_str(), mesg.length() );
+        }
       }
-      else // data to read  (simple echo server..)
+      else // data to read  (simple echo server..)  (EPOLLIN 0x0001 event..)
       {
         int fd = events[i].data.fd;
+        // TODO: technically if we have a disconnect, EPOLLHUP (0x2000) will also be set..
+        // so we could skip the read and just close the socket if we wanted too..
+
         // do stuff to read and handle input data from client.
         char bufin[1024];
         int size = read(fd, &bufin, 1024);
@@ -308,6 +346,7 @@ void TCP_Server::event_worker() {
             std::cerr << "\n";
           }
         } else {
+          // Socket read error. (0 or less bytes received.., seen on disconnect.. )
           std::cerr << "Client " << fd << " read_error, closing socket..\n";
           vector<int>::iterator it;
           it = find(client_fd_list.begin(), client_fd_list.end(), fd);
@@ -368,7 +407,6 @@ int main() {
 
   while (AppRunning.load() == true) {
     // wait for ctrl-c to be pressed.
-
   }
 
   std::cerr << "\n[N] Main Loop Exit.. Starting Shutdown..\n";
